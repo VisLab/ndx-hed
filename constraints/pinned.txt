@@ -14,7 +14,7 @@ linkify-it-py==2.1.0
 myst-parser==4.0.1
 pre-commit==3.5.0
 pynwb==4.0.0
-pytest==8.3.3
+pytest==9.1.1
 pytest-cov==5.0.0
 python-dateutil==2.8.2
 pytest-subtests==0.12.0
