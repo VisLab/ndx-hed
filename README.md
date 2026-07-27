@@ -29,7 +29,7 @@ from datetime import datetime
 nwbfile = NWBFile(
     session_description="Example session with HED annotations",
     identifier="example_session_001",
-    session_start_time=datetime.now()
+    session_start_time=datetime.now(),
 )
 
 # Add HED schema metadata (required)
@@ -37,19 +37,10 @@ hed_metadata = HedLabMetaData(hed_schema_version="8.4.0")
 nwbfile.add_lab_meta_data(hed_metadata)
 
 # Add HED column to trials table
-nwbfile.add_trial_column(
-    name="HED",
-    col_cls=HedTags,
-    data=[],
-    description="HED annotations for trials"
-)
+nwbfile.add_trial_column(name="HED", col_cls=HedTags, data=[], description="HED annotations for trials")
 
 # Add trials with HED annotations
-nwbfile.add_trial(
-    start_time=0.0,
-    stop_time=1.0,
-    HED="Experimental-trial, (Sensory-event, Visual-presentation)"
-)
+nwbfile.add_trial(start_time=0.0, stop_time=1.0, HED="Experimental-trial, (Sensory-event, Visual-presentation)")
 ```
 
 ## Main classes
