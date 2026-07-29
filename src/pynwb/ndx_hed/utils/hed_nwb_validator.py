@@ -100,15 +100,22 @@ class HedNWBValidator:
 
         Returns:
             List[Dict[str, Any]]: A list of validation issues found in the HedTags column
+
+        Notes:
+            An annotation that has already been validated in this column and found to have no issues
+            is not validated again on the rows that repeat it. Such a row contributes nothing to the
+            result, so the issues returned are the same as if every row were validated. A row whose
+            annotation does have issues is still validated, so that each affected row is reported.
         """
         if hed_tags is None or not isinstance(hed_tags, HedTags):
             raise ValueError("The provided hed_tags is not a valid HedTags instance.")
         if error_handler is None:
             error_handler = ErrorHandler(check_for_warnings=False)
         issues = []
+        validated_without_issues = set()
 
         for index, tag in enumerate(hed_tags.data):
-            if tag is None or tag == "" or tag == "n/a":
+            if tag is None or tag == "" or tag == "n/a" or tag in validated_without_issues:
                 continue
 
             error_handler.push_error_context(ErrorContext.ROW, index)
@@ -116,6 +123,9 @@ class HedNWBValidator:
             row_issues = hed_obj.validate(allow_placeholders=False, error_handler=error_handler)
             issues += row_issues
             error_handler.pop_error_context()
+
+            if not row_issues:
+                validated_without_issues.add(tag)
 
         return issues
 
@@ -132,6 +142,10 @@ class HedNWBValidator:
 
         Returns:
             List[Dict[str, Any]]: A list of validation issues found in the HedValueVector column
+
+        Notes:
+            As in validate_vector, a substituted annotation that has already been validated in this
+            column and found to have no issues is not validated again on the rows that repeat it.
         """
         if hed_values is None or not isinstance(hed_values, HedValueVector) or hed_values.hed is None:
             raise ValueError("The provided hed_values is not a valid HedValueVector instance.")
@@ -145,17 +159,25 @@ class HedNWBValidator:
         if check_for_any_errors(issues):
             return issues
 
+        validated_without_issues = set()
         for index, tag in enumerate(hed_values.data):
             if tag is None or tag == "" or tag == "n/a" or (isinstance(tag, float) and math.isnan(tag)):
                 continue
 
-            error_handler.push_error_context(ErrorContext.ROW, index)
             # Substitute the tag value into the template in place of #
             eval_tag = hed_values.hed.replace("#", str(tag))
+            if eval_tag in validated_without_issues:
+                continue
+
+            error_handler.push_error_context(ErrorContext.ROW, index)
             hed_obj = HedString(eval_tag, self.hed_schema, def_dict=self.def_dict)
             row_issues = hed_obj.validate(allow_placeholders=False, error_handler=error_handler)
             issues += row_issues
             error_handler.pop_error_context()
+
+            if not row_issues:
+                validated_without_issues.add(eval_tag)
+
         return issues
 
     def validate_events(
