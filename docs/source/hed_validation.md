@@ -69,7 +69,19 @@ A `MeaningsTable` is not validated on its own. Its categorical HED is validated 
 | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `extract_meanings(sidecar)`                                                | BIDS sidecar to a meanings dictionary.                                                |
 | `get_events_table(name, description, df, meanings)`                        | BIDS dataframe plus meanings to an `EventsTable`.                                     |
-| `get_bids_tabular(table)`                                                  | Any `DynamicTable` to a BIDS `(dataframe, sidecar)` pair. Formerly `get_bids_events`. |
+| `get_bids_tabular(table, hed_metadata=None)`                               | Any `DynamicTable` to a BIDS `(dataframe, sidecar)` pair. Formerly `get_bids_events`. |
+| `get_json_hed_dict(table, hed_metadata=None)`                              | Any `DynamicTable` to just its BIDS JSON sidecar dict (no dataframe, no pandas).      |
+| `get_levels_and_hed(meanings_table)`                                       | A `MeaningsTable` to its `(Levels, HED)` sidecar dictionaries.                        |
+
+### Definitions in the exported sidecar
+
+In NWB, HED definitions live in the `HedLabMetaData` object, which is the only place extra definitions may come from. BIDS instead carries them in the sidecar, in an entry that names no column. `get_json_hed_dict` (and `get_bids_tabular`) therefore take an optional `HedLabMetaData`; when one is supplied, its definitions are exported as
+
+```json
+{"definitions": {"HED": {"defList": "(Definition/go,(Sensory-event))"}}}
+```
+
+so the sidecar is self-contained and any `Def/` references in the table resolve from it alone. Without the metadata no such entry is written, and `Def/` references in the exported sidecar are unresolvable (`DEF_INVALID`) unless the definitions are supplied separately — which is what `HedNWBValidator` does internally, passing the `DefinitionDict` from its own `HedLabMetaData` as hedtools' `extra_def_dicts`.
 | `HedNWBValidator.validate_file(nwbfile)`                                   | Assembled validation of every table in a file.                                        |
 | `HedNWBValidator.validate_events(events)`                                  | Assembled validation of a single `EventsTable`.                                       |
 | `HedNWBValidator.validate_table / validate_vector / validate_value_vector` | Per-column validation of a table or column.                                           |
