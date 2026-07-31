@@ -7,6 +7,7 @@ import io
 import os
 import json
 from unittest import mock
+import numpy as np
 import pandas as pd
 from hed.schema import load_schema_version
 from hed.models import DefinitionDict, Sidecar, TabularInput
@@ -701,6 +702,34 @@ class TestGetLevelsAndHed(unittest.TestCase):
         self.assertEqual(sorted(levels.keys()), ["a", "b", "c", "d"])
         self.assertEqual(hed_dict, {"a": "Sensory-event"})
 
+    def test_get_levels_and_hed_numpy_nan_omitted(self):
+        """NaN is detected for every float width, not just Python's float.
+
+        numpy's float32 and float16 do not subclass Python's float, so an isinstance-based NaN
+        check would let those through as if they were real HED annotations.
+        """
+        _, meanings_table = _categorical_table(
+            ["a", "b", "c", "d"],
+            ["a", "b", "c", "d"],
+            ["Level A", "Level B", "Level C", "Level D"],
+            hed_data=["Sensory-event", np.float64("nan"), np.float32("nan"), np.float16("nan")],
+        )
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(sorted(levels.keys()), ["a", "b", "c", "d"])
+        self.assertEqual(hed_dict, {"a": "Sensory-event"})
+
+    def test_get_levels_and_hed_non_nan_number_kept(self):
+        """A numeric HED value that is not NaN is not treated as missing."""
+        _, meanings_table = _categorical_table(
+            ["a", "b"], ["a", "b"], ["Level A", "Level B"], hed_data=["Sensory-event", 0.0]
+        )
+
+        _, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(hed_dict, {"a": "Sensory-event", "b": 0.0})
+
     def test_get_levels_and_hed_keeps_na_string(self):
         """An explicit "n/a" HED string is kept -- it is the BIDS marker for no annotation."""
         _, meanings_table = _categorical_table(
@@ -1269,6 +1298,66 @@ class TestGetBidsTabular(unittest.TestCase):
         self.assertIn("response_time", json_data)
         self.assertEqual(json_data["trial_num"]["HED"], "Experimental-trial/#")
         self.assertEqual(json_data["response_time"]["HED"], "Agent-action, Response-time, Parameter-value/#")
+
+    def test_get_bids_tabular_unrelated_timestamp_column_not_renamed(self):
+        """A plain column named "timestamp" is not renamed to onset.
+
+        Only a TimestampVectorData column becomes "onset". A table whose "timestamp" column is an
+        ordinary VectorData is not time-anchored in the BIDS sense, even if some other column of the
+        table happens to be a TimestampVectorData.
+        """
+        table = DynamicTable(
+            name="samples",
+            description="A plain timestamp column plus a differently named TimestampVectorData",
+            columns=[
+                VectorData(name="timestamp", description="Acquisition sample counter", data=[10, 20]),
+                TimestampVectorData(name="event_time", description="Event times", data=[0.5, 1.5]),
+            ],
+        )
+
+        df, _ = get_bids_tabular(table)
+
+        self.assertIn("timestamp", df.columns)
+        self.assertNotIn("onset", df.columns)
+        self.assertEqual(list(df["timestamp"]), [10, 20])
+
+    def test_get_bids_tabular_timestamp_vector_data_renamed(self):
+        """A TimestampVectorData column named "timestamp" is renamed to onset."""
+        table = DynamicTable(
+            name="events",
+            description="A real timestamp column",
+            columns=[TimestampVectorData(name="timestamp", description="Event times", data=[0.5, 1.5])],
+        )
+
+        df, _ = get_bids_tabular(table)
+
+        self.assertIn("onset", df.columns)
+        self.assertNotIn("timestamp", df.columns)
+        self.assertEqual(list(df["onset"]), [0.5, 1.5])
+
+    def test_get_bids_tabular_extra_timestamp_column_not_renamed(self):
+        """Only the canonical "timestamp" column becomes onset, even with several time columns.
+
+        PyNWB 4 allows more than one TimestampVectorData column in an EventsTable (extra ones fill
+        DynamicTable's ``VectorData quantity: '*'`` slot), but BIDS has exactly one onset. The
+        column named "timestamp" -- the one the EventsTable schema requires -- is the canonical one.
+        """
+        events = EventsTable(name="events", description="Events with a second time column")
+        events.add_column(name="stop_time", description="End of the event", col_cls=TimestampVectorData)
+        events.add_event(timestamp=0.1, duration=0.05, stop_time=0.15)
+        events.add_event(timestamp=0.2, duration=0.05, stop_time=0.25)
+        self.assertEqual(
+            [name for name in events.colnames if isinstance(events[name], TimestampVectorData)],
+            ["timestamp", "stop_time"],
+        )
+
+        df, _ = get_bids_tabular(events)
+
+        self.assertIn("onset", df.columns)
+        self.assertNotIn("timestamp", df.columns)
+        self.assertIn("stop_time", df.columns)
+        self.assertEqual(list(df["onset"]), [0.1, 0.2])
+        self.assertEqual(list(df["stop_time"]), [0.15, 0.25])
 
     def test_get_bids_tabular_roundtrip(self):
         """Test roundtrip conversion: DataFrame/JSON -> EventsTable -> DataFrame/JSON."""

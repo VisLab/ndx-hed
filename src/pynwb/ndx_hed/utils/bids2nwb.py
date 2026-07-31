@@ -189,8 +189,21 @@ def _get_meanings_table(table: DynamicTable, col_name: str) -> Union["MeaningsTa
 
 
 def _is_missing(value) -> bool:
-    """Returns True if a value is missing (None, NaN, or the empty string)."""
-    return value is None or value == "" or (isinstance(value, float) and math.isnan(value))
+    """
+    Returns True if a HED value is missing (None, the empty string, or a NaN of any float width).
+
+    The NaN test converts rather than checking isinstance(value, float): numpy's float32 and float16
+    do not subclass Python's float (only float64 does), so an isinstance check would silently treat
+    those NaNs as present.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    try:
+        return bool(math.isnan(value))
+    except (TypeError, ValueError):  # not a number at all, so not a NaN
+        return False
 
 
 def get_levels_and_hed(meanings_table: "MeaningsTable") -> tuple:
@@ -350,10 +363,10 @@ def get_bids_tabular(table: DynamicTable, hed_metadata: HedLabMetaData = None) -
     # Get DataFrame from the table
     df = table.to_dataframe()
 
-    # Rename the timestamp column back to onset so the table reads as a BIDS timeline file
-    if "timestamp" in df.columns and any(
-        isinstance(table[col_name], TimestampVectorData) for col_name in table.colnames
-    ):
+    # Rename the timestamp column back to onset so the table reads as a BIDS timeline file. The
+    # "timestamp" column must itself be a TimestampVectorData -- an unrelated column that merely
+    # happens to be named "timestamp" is left alone.
+    if "timestamp" in table.colnames and isinstance(table["timestamp"], TimestampVectorData):
         df = df.rename(columns={"timestamp": "onset"})
 
     return df, get_json_hed_dict(table, hed_metadata)
