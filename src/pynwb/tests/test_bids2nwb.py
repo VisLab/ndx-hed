@@ -3,20 +3,27 @@ Unit tests for bids2nwb utility functions.
 """
 
 import unittest
+import io
 import os
 import json
+from unittest import mock
+import numpy as np
 import pandas as pd
 from hed.schema import load_schema_version
-from hed.models import DefinitionDict
+from hed.models import DefinitionDict, Sidecar, TabularInput
 from pynwb.event import EventsTable, TimestampVectorData, DurationVectorData
 from hdmf.common import MeaningsTable
-from ndx_hed import HedTags, HedValueVector
+from ndx_hed import HedLabMetaData, HedTags, HedValueVector
 from pynwb.core import DynamicTable, VectorData
+from ndx_hed.utils import bids2nwb
 from ndx_hed.utils.bids2nwb import (
+    DEFINITIONS_KEY,
     extract_meanings,
     get_categorical_meanings,
     get_events_table,
     get_bids_tabular,
+    get_json_hed_dict,
+    get_levels_and_hed,
     extract_definitions,
 )
 
@@ -633,6 +640,524 @@ class TestGetEventsTable(unittest.TestCase):
             self.assertEqual(len(result[col_name].data), len(df))
 
 
+def _categorical_table(values, meanings_values, meaning_strings, hed_data=None, col_description="A category"):
+    """Builds a one-column DynamicTable whose column is annotated by a MeaningsTable.
+
+    Returns a (table, meanings_table) tuple. If hed_data is None the MeaningsTable has no HED column.
+    """
+    column = VectorData(name="category", description=col_description, data=values)
+    table = DynamicTable(name="cat_table", description="Table with a categorical column", columns=[column])
+    meanings_table = MeaningsTable(target=column, description="Meanings for category")
+    for value, meaning in zip(meanings_values, meaning_strings, strict=True):
+        meanings_table.add_row(value=value, meaning=meaning)
+    if hed_data is not None:
+        meanings_table.add_column(name="HED", description="HED tags for category", col_cls=HedTags, data=list(hed_data))
+    table.add_meanings_table(meanings_table)
+    return table, meanings_table
+
+
+class TestGetLevelsAndHed(unittest.TestCase):
+    """Test class for get_levels_and_hed function."""
+
+    def test_get_levels_and_hed_with_hed(self):
+        """Both Levels and HED are extracted when the MeaningsTable has a HED column."""
+        _, meanings_table = _categorical_table(
+            ["a", "b"], ["a", "b"], ["Level A", "Level B"], hed_data=["Sensory-event", "Agent-action"]
+        )
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(levels, {"a": "Level A", "b": "Level B"})
+        self.assertEqual(hed_dict, {"a": "Sensory-event", "b": "Agent-action"})
+
+    def test_get_levels_and_hed_without_hed_column(self):
+        """A MeaningsTable with no HED column yields Levels and an empty HED dict."""
+        _, meanings_table = _categorical_table(["a", "b"], ["a", "b"], ["Level A", "Level B"])
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(levels, {"a": "Level A", "b": "Level B"})
+        self.assertEqual(hed_dict, {})
+
+    def test_get_levels_and_hed_empty_meanings_table(self):
+        """An empty MeaningsTable yields two empty dicts."""
+        _, meanings_table = _categorical_table([], [], [])
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(levels, {})
+        self.assertEqual(hed_dict, {})
+
+    def test_get_levels_and_hed_missing_hed_values_omitted(self):
+        """Values whose HED is None, NaN, or empty are left out of the HED dict, but kept in Levels."""
+        _, meanings_table = _categorical_table(
+            ["a", "b", "c", "d"],
+            ["a", "b", "c", "d"],
+            ["Level A", "Level B", "Level C", "Level D"],
+            hed_data=["Sensory-event", "", None, float("nan")],
+        )
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(sorted(levels.keys()), ["a", "b", "c", "d"])
+        self.assertEqual(hed_dict, {"a": "Sensory-event"})
+
+    def test_get_levels_and_hed_numpy_nan_omitted(self):
+        """NaN is detected for every float width, not just Python's float.
+
+        numpy's float32 and float16 do not subclass Python's float, so an isinstance-based NaN
+        check would let those through as if they were real HED annotations.
+        """
+        _, meanings_table = _categorical_table(
+            ["a", "b", "c", "d"],
+            ["a", "b", "c", "d"],
+            ["Level A", "Level B", "Level C", "Level D"],
+            hed_data=["Sensory-event", np.float64("nan"), np.float32("nan"), np.float16("nan")],
+        )
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(sorted(levels.keys()), ["a", "b", "c", "d"])
+        self.assertEqual(hed_dict, {"a": "Sensory-event"})
+
+    def test_get_levels_and_hed_non_nan_number_kept(self):
+        """A numeric HED value that is not NaN is not treated as missing."""
+        _, meanings_table = _categorical_table(
+            ["a", "b"], ["a", "b"], ["Level A", "Level B"], hed_data=["Sensory-event", 0.0]
+        )
+
+        _, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(hed_dict, {"a": "Sensory-event", "b": 0.0})
+
+    def test_get_levels_and_hed_keeps_na_string(self):
+        """An explicit "n/a" HED string is kept -- it is the BIDS marker for no annotation."""
+        _, meanings_table = _categorical_table(
+            ["a", "b"], ["a", "b"], ["Level A", "Level B"], hed_data=["Sensory-event", "n/a"]
+        )
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(levels, {"a": "Level A", "b": "Level B"})
+        self.assertEqual(hed_dict, {"a": "Sensory-event", "b": "n/a"})
+
+    def test_get_levels_and_hed_levels_not_in_data(self):
+        """Levels come from the MeaningsTable, not from the values observed in the column."""
+        _, meanings_table = _categorical_table(
+            ["a", "a"], ["a", "b", "c"], ["Level A", "Level B", "Level C"], hed_data=["Sensory-event"] * 3
+        )
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(sorted(levels.keys()), ["a", "b", "c"])
+        self.assertEqual(sorted(hed_dict.keys()), ["a", "b", "c"])
+
+    def test_get_levels_and_hed_numeric_values(self):
+        """Numeric values are kept as-is and remain JSON-serializable."""
+        _, meanings_table = _categorical_table(
+            [1, 2, 1], [1, 2], ["One", "Two"], hed_data=["Sensory-event", "Agent-action"]
+        )
+
+        levels, hed_dict = get_levels_and_hed(meanings_table)
+
+        self.assertEqual(levels, {1: "One", 2: "Two"})
+        self.assertEqual(hed_dict, {1: "Sensory-event", 2: "Agent-action"})
+        # int keys survive json serialization (they become strings, as BIDS sidecars require)
+        self.assertEqual(json.loads(json.dumps(levels)), {"1": "One", "2": "Two"})
+
+
+class TestGetJsonHedDict(unittest.TestCase):
+    """Test class for get_json_hed_dict function."""
+
+    def setUp(self):
+        """Set up an EventsTable exercising every kind of column."""
+        sample_df = pd.DataFrame({
+            "onset": [0.0, 1.5, 3.0],
+            "duration": [0.5, 1.0, 0.8],
+            "event_type": ["show_cross", "left_click", "show_cross"],
+            "trial": [1, 2, 3],
+            "HED": ["Sensory-event", "Agent-action", "Sensory-event"],
+            "extra": ["a", "b", "c"],
+        })
+
+        meanings = {
+            "categorical": {
+                "event_type": {
+                    "Levels": {"show_cross": "Display a cross", "left_click": "Left button press"},
+                    "HED": {
+                        "show_cross": "Sensory-event, Visual-presentation",
+                        "left_click": "Agent-action, Press",
+                    },
+                }
+            },
+            "value": {"trial": "Experimental-trial/#"},
+        }
+
+        self.events_table = get_events_table(
+            name="test_events", description="Test events for conversion", df=sample_df, meanings=meanings
+        )
+
+    def test_get_json_hed_dict_basic(self):
+        """The sidecar has one entry per column that carries metadata."""
+        json_data = get_json_hed_dict(self.events_table)
+
+        self.assertIsInstance(json_data, dict)
+        self.assertEqual(set(json_data.keys()), {"timestamp", "duration", "event_type", "trial", "extra"})
+
+        # Categorical column: Levels and per-value HED from its MeaningsTable
+        self.assertEqual(
+            json_data["event_type"]["Levels"],
+            {"show_cross": "Display a cross", "left_click": "Left button press"},
+        )
+        self.assertEqual(
+            json_data["event_type"]["HED"],
+            {"show_cross": "Sensory-event, Visual-presentation", "left_click": "Agent-action, Press"},
+        )
+
+        # Value column: the HED template
+        self.assertEqual(json_data["trial"]["HED"], "Experimental-trial/#")
+
+        # A plain column contributes only its description
+        self.assertEqual(json_data["extra"], {"Description": "Value column extra"})
+
+    def test_get_json_hed_dict_hed_column_omitted(self):
+        """The self-describing HedTags column never appears in the sidecar."""
+        json_data = get_json_hed_dict(self.events_table)
+
+        # "HED" is a reserved sidecar key and must not name an entry
+        self.assertIn("HED", self.events_table.colnames)
+        self.assertIsInstance(self.events_table["HED"], HedTags)
+        self.assertNotIn("HED", json_data)
+
+    def test_get_json_hed_dict_only_hed_column(self):
+        """A table whose only annotated column is the HED column has an empty sidecar."""
+        table = DynamicTable(
+            name="hed_only",
+            description="Only a HED column",
+            columns=[HedTags(data=["Sensory-event", "Agent-action"])],
+        )
+
+        self.assertEqual(get_json_hed_dict(table), {})
+
+    def test_get_json_hed_dict_timestamp_and_duration(self):
+        """Timestamp and duration columns contribute a description but no HED metadata."""
+        json_data = get_json_hed_dict(self.events_table)
+
+        self.assertIsInstance(self.events_table["timestamp"], TimestampVectorData)
+        self.assertIsInstance(self.events_table["duration"], DurationVectorData)
+        self.assertEqual(json_data["timestamp"], {"Description": "Onset times of events"})
+        self.assertEqual(json_data["duration"], {"Description": "Duration of events"})
+
+    def test_get_json_hed_dict_keys_are_column_names(self):
+        """Sidecar keys are the table's own column names -- the timestamp column is not renamed.
+
+        get_bids_tabular() renames the timestamp column to "onset" in the dataframe (so the table
+        reads as a BIDS timeline file) but the sidecar entry keeps the column name it had.
+        """
+        df, json_data = get_bids_tabular(self.events_table)
+
+        self.assertIn("onset", df.columns)
+        self.assertNotIn("timestamp", df.columns)
+        self.assertIn("timestamp", json_data)
+        self.assertNotIn("onset", json_data)
+
+    def test_get_json_hed_dict_matches_get_bids_tabular(self):
+        """get_bids_tabular returns exactly the dictionary that get_json_hed_dict builds."""
+        _, json_data = get_bids_tabular(self.events_table)
+
+        self.assertEqual(json_data, get_json_hed_dict(self.events_table))
+
+    def test_get_json_hed_dict_does_not_use_pandas(self):
+        """The function reads the columns directly, so it works with pandas unavailable."""
+        expected = get_json_hed_dict(self.events_table)
+
+        with mock.patch.object(bids2nwb, "pd", None):
+            json_data = bids2nwb.get_json_hed_dict(self.events_table)
+
+        self.assertEqual(json_data, expected)
+
+    def test_get_json_hed_dict_plain_dynamic_table(self):
+        """A plain (non-EventsTable) DynamicTable with HED columns."""
+        table = DynamicTable(
+            name="trials",
+            description="A plain table with HED",
+            columns=[
+                VectorData(name="trial_id", description="Trial IDs", data=[1, 2]),
+                HedTags(data=["Sensory-event", "Agent-action"]),
+                HedValueVector(name="reaction_time", description="RTs", data=[0.5, 0.6], hed="(Duration, # s)"),
+            ],
+        )
+
+        json_data = get_json_hed_dict(table)
+
+        self.assertEqual(
+            json_data,
+            {
+                "trial_id": {"Description": "Trial IDs"},
+                "reaction_time": {"Description": "RTs", "HED": "(Duration, # s)"},
+            },
+        )
+
+    def test_get_json_hed_dict_categorical_without_hed(self):
+        """A MeaningsTable with no HED column yields Levels but no HED entry."""
+        table, _ = _categorical_table(["a", "b"], ["a", "b"], ["Level A", "Level B"])
+
+        json_data = get_json_hed_dict(table)
+
+        self.assertEqual(json_data["category"]["Levels"], {"a": "Level A", "b": "Level B"})
+        self.assertNotIn("HED", json_data["category"])
+
+    def test_get_json_hed_dict_categorical_with_hed(self):
+        """A MeaningsTable with a HED column yields both Levels and HED entries."""
+        table, _ = _categorical_table(
+            ["a", "b"], ["a", "b"], ["Level A", "Level B"], hed_data=["Sensory-event", "Agent-action"]
+        )
+
+        json_data = get_json_hed_dict(table)
+
+        self.assertEqual(
+            json_data["category"],
+            {
+                "Description": "A category",
+                "Levels": {"a": "Level A", "b": "Level B"},
+                "HED": {"a": "Sensory-event", "b": "Agent-action"},
+            },
+        )
+
+    def test_get_json_hed_dict_categorical_empty_meanings(self):
+        """An empty MeaningsTable adds neither Levels nor HED."""
+        table, _ = _categorical_table([], [], [])
+
+        self.assertEqual(get_json_hed_dict(table), {"category": {"Description": "A category"}})
+
+    def test_get_json_hed_dict_no_meanings_table(self):
+        """A plain column with no MeaningsTable contributes only its description."""
+        table = DynamicTable(
+            name="plain",
+            description="No meanings tables",
+            columns=[VectorData(name="category", description="A category", data=["a", "b"])],
+        )
+
+        self.assertEqual(get_json_hed_dict(table), {"category": {"Description": "A category"}})
+
+    def test_get_json_hed_dict_no_metadata(self):
+        """Columns with no description and no HED metadata are omitted entirely."""
+        table = DynamicTable(
+            name="bare",
+            description="Columns without descriptions",
+            columns=[VectorData(name="x", description="", data=[1, 2])],
+        )
+
+        self.assertEqual(get_json_hed_dict(table), {})
+
+    def test_get_json_hed_dict_empty_table(self):
+        """A table with no columns yields an empty sidecar."""
+        table = DynamicTable(name="empty", description="No columns")
+
+        self.assertEqual(get_json_hed_dict(table), {})
+
+    def test_get_json_hed_dict_is_json_serializable(self):
+        """The result can be serialized, which is how the validator feeds it to hedtools."""
+        table, _ = _categorical_table([1, 2], [1, 2], ["One", "Two"], hed_data=["Sensory-event", "Agent-action"])
+
+        round_tripped = json.loads(json.dumps(get_json_hed_dict(table)))
+
+        self.assertEqual(round_tripped["category"]["Levels"], {"1": "One", "2": "Two"})
+        self.assertEqual(round_tripped["category"]["HED"], {"1": "Sensory-event", "2": "Agent-action"})
+
+    def test_get_json_hed_dict_real_data(self):
+        """A sidecar built from real BIDS test data round-trips its HED metadata."""
+        current_dir = os.path.dirname(__file__)
+        data_dir = os.path.join(current_dir, "data")
+        tsv_path = os.path.join(data_dir, "sub-001_ses-01_task-WorkingMemory_run-1_events.tsv")
+        json_path = os.path.join(data_dir, "task-WorkingMemory_events.json")
+
+        if not os.path.exists(tsv_path) or not os.path.exists(json_path):
+            self.skipTest("Real test data files not found")
+
+        df = pd.read_csv(tsv_path, sep="\t")
+        with open(json_path, "r") as f:
+            sidecar_data = json.load(f)
+
+        events_table = get_events_table("real_events", "Real event data", df, extract_meanings(sidecar_data))
+        json_data = get_json_hed_dict(events_table)
+
+        # Every value column keeps its HED template
+        for col_name, hed_string in extract_meanings(sidecar_data)["value"].items():
+            self.assertEqual(json_data[col_name]["HED"], hed_string)
+
+        # Every categorical column keeps its levels and per-value HED
+        for col_name, column_info in extract_meanings(sidecar_data)["categorical"].items():
+            self.assertEqual(json_data[col_name]["Levels"], column_info["Levels"])
+            self.assertEqual(json_data[col_name]["HED"], column_info["HED"])
+
+        # The HED column itself is not a sidecar entry
+        self.assertNotIn("HED", json_data)
+
+
+class TestGetJsonHedDictDefinitions(unittest.TestCase):
+    """Test class for the HedLabMetaData definitions exported by get_json_hed_dict."""
+
+    def setUp(self):
+        """Set up a table whose HED column uses definitions, plus the metadata defining them."""
+        self.definitions = "(Definition/Go, (Sensory-event)), (Definition/Stop, (Agent-action))"
+        self.hed_metadata = HedLabMetaData(hed_schema_version="8.4.0", definitions=self.definitions)
+        self.hed_schema = self.hed_metadata.get_hed_schema()
+        self.table = DynamicTable(
+            name="trials",
+            description="Trials whose HED uses definitions",
+            columns=[
+                VectorData(name="trial", description="Trial number", data=[1, 2]),
+                HedTags(data=["Def/Go", "Def/Stop"]),
+            ],
+        )
+
+    def test_definitions_omitted_without_metadata(self):
+        """No HedLabMetaData means no definitions entry."""
+        json_data = get_json_hed_dict(self.table)
+
+        self.assertNotIn(DEFINITIONS_KEY, json_data)
+        self.assertEqual(json_data, {"trial": {"Description": "Trial number"}})
+
+    def test_definitions_exported_with_metadata(self):
+        """The definitions are exported under the "definitions" key as a BIDS defList entry."""
+        json_data = get_json_hed_dict(self.table, self.hed_metadata)
+
+        self.assertIn(DEFINITIONS_KEY, json_data)
+        self.assertEqual(list(json_data[DEFINITIONS_KEY].keys()), ["HED"])
+        def_list = json_data[DEFINITIONS_KEY]["HED"]["defList"]
+        # HED lowercases definition names
+        self.assertIn("(Definition/go,(Sensory-event))", def_list)
+        self.assertIn("(Definition/stop,(Agent-action))", def_list)
+
+    def test_definitions_do_not_disturb_column_entries(self):
+        """The definitions entry is added alongside the column entries, which are unchanged."""
+        without = get_json_hed_dict(self.table)
+        with_defs = get_json_hed_dict(self.table, self.hed_metadata)
+
+        self.assertEqual({key: value for key, value in with_defs.items() if key != DEFINITIONS_KEY}, without)
+
+    def test_definitions_metadata_without_definitions(self):
+        """A HedLabMetaData holding no definitions adds no entry."""
+        bare_metadata = HedLabMetaData(hed_schema_version="8.4.0")
+
+        json_data = get_json_hed_dict(self.table, bare_metadata)
+
+        self.assertIsNone(bare_metadata.definitions)
+        self.assertNotIn(DEFINITIONS_KEY, json_data)
+
+    def test_definitions_added_by_add_definitions(self):
+        """Definitions added to the metadata after construction are exported too."""
+        metadata = HedLabMetaData(hed_schema_version="8.4.0")
+        metadata.add_definitions("(Definition/Later, (Sensory-event))")
+
+        json_data = get_json_hed_dict(self.table, metadata)
+
+        self.assertIn("(Definition/later,(Sensory-event))", json_data[DEFINITIONS_KEY]["HED"]["defList"])
+
+    def test_definitions_round_trip_through_extract_definitions(self):
+        """The exported entry is read back by extract_definitions() into the same definitions."""
+        json_data = get_json_hed_dict(self.table, self.hed_metadata)
+
+        recovered, issues = extract_definitions(json_data, self.hed_schema)
+
+        self.assertIsInstance(recovered, DefinitionDict)
+        self.assertEqual(issues, [])
+        self.assertEqual(sorted(recovered.defs.keys()), ["go", "stop"])
+        original = self.hed_metadata.get_definition_dict()
+        self.assertEqual(sorted(recovered.defs.keys()), sorted(original.defs.keys()))
+
+    def test_definitions_make_sidecar_self_contained(self):
+        """With the definitions in the sidecar, Def/ references validate on their own.
+
+        This is the point of exporting them: no separately supplied definitions are needed.
+        """
+        df, json_data = get_bids_tabular(self.table, self.hed_metadata)
+        sidecar = Sidecar(io.StringIO(json.dumps(json_data)), name="trials")
+
+        issues = TabularInput(file=df, sidecar=sidecar, name="trials").validate(self.hed_schema)
+
+        self.assertEqual(issues, [])
+
+    def test_missing_definitions_leave_def_references_invalid(self):
+        """Without the metadata the same table has unresolvable Def/ references."""
+        df, json_data = get_bids_tabular(self.table)
+        sidecar = Sidecar(io.StringIO(json.dumps(json_data)), name="trials")
+
+        issues = TabularInput(file=df, sidecar=sidecar, name="trials").validate(self.hed_schema)
+
+        self.assertTrue(issues)
+        self.assertEqual({issue["code"] for issue in issues}, {"DEF_INVALID"})
+
+    def test_get_bids_tabular_forwards_metadata(self):
+        """get_bids_tabular passes the metadata through to get_json_hed_dict."""
+        _, json_data = get_bids_tabular(self.table, self.hed_metadata)
+
+        self.assertEqual(json_data, get_json_hed_dict(self.table, self.hed_metadata))
+        self.assertIn(DEFINITIONS_KEY, json_data)
+
+    def test_bad_metadata_type_raises(self):
+        """Only a HedLabMetaData may supply definitions."""
+        with self.assertRaises(ValueError) as context:
+            get_json_hed_dict(self.table, "(Definition/Go, (Sensory-event))")
+
+        self.assertIn("HedLabMetaData", str(context.exception))
+
+    def test_definitions_column_name_collision_raises(self):
+        """A column named "definitions" would be overwritten by the definitions entry."""
+        table = DynamicTable(
+            name="collide",
+            description="Table with a definitions column",
+            columns=[VectorData(name=DEFINITIONS_KEY, description="Not the HED definitions", data=["a", "b"])],
+        )
+
+        with self.assertRaises(ValueError) as context:
+            get_json_hed_dict(table, self.hed_metadata)
+
+        self.assertIn(DEFINITIONS_KEY, str(context.exception))
+        # Without definitions to export there is no collision, so the column keeps its entry
+        self.assertEqual(get_json_hed_dict(table)[DEFINITIONS_KEY], {"Description": "Not the HED definitions"})
+
+    def test_definitions_with_value_and_categorical_columns(self):
+        """Definitions coexist with HedValueVector templates and categorical Levels/HED."""
+        column = VectorData(name="event_type", description="Event type", data=["go", "stop"])
+        table = DynamicTable(
+            name="events",
+            description="Every kind of HED column plus definitions",
+            columns=[
+                column,
+                HedTags(data=["Def/Go", "Def/Stop"]),
+                HedValueVector(name="latency", description="Latency", data=[0.1, 0.2], hed="(Time-value/# s)"),
+            ],
+        )
+        meanings_table = MeaningsTable(target=column, description="Meanings for event_type")
+        meanings_table.add_row(value="go", meaning="Go trial")
+        meanings_table.add_row(value="stop", meaning="Stop trial")
+        meanings_table.add_column(
+            name="HED", description="HED for event_type", col_cls=HedTags, data=["Def/Go", "Def/Stop"]
+        )
+        table.add_meanings_table(meanings_table)
+
+        json_data = get_json_hed_dict(table, self.hed_metadata)
+
+        self.assertEqual(json_data["latency"]["HED"], "(Time-value/# s)")
+        self.assertEqual(json_data["event_type"]["Levels"], {"go": "Go trial", "stop": "Stop trial"})
+        self.assertEqual(json_data["event_type"]["HED"], {"go": "Def/Go", "stop": "Def/Stop"})
+        self.assertIn(DEFINITIONS_KEY, json_data)
+        # The categorical HED also resolves against the exported definitions
+        sidecar = Sidecar(io.StringIO(json.dumps(json_data)), name="events")
+        self.assertEqual(sidecar.validate(self.hed_schema), [])
+
+    def test_definitions_does_not_use_pandas(self):
+        """Exporting the definitions keeps get_json_hed_dict free of pandas."""
+        expected = get_json_hed_dict(self.table, self.hed_metadata)
+
+        with mock.patch.object(bids2nwb, "pd", None):
+            json_data = bids2nwb.get_json_hed_dict(self.table, self.hed_metadata)
+
+        self.assertEqual(json_data, expected)
+
+
 class TestGetBidsTabular(unittest.TestCase):
     """Test class for get_bids_tabular function."""
 
@@ -773,6 +1298,66 @@ class TestGetBidsTabular(unittest.TestCase):
         self.assertIn("response_time", json_data)
         self.assertEqual(json_data["trial_num"]["HED"], "Experimental-trial/#")
         self.assertEqual(json_data["response_time"]["HED"], "Agent-action, Response-time, Parameter-value/#")
+
+    def test_get_bids_tabular_unrelated_timestamp_column_not_renamed(self):
+        """A plain column named "timestamp" is not renamed to onset.
+
+        Only a TimestampVectorData column becomes "onset". A table whose "timestamp" column is an
+        ordinary VectorData is not time-anchored in the BIDS sense, even if some other column of the
+        table happens to be a TimestampVectorData.
+        """
+        table = DynamicTable(
+            name="samples",
+            description="A plain timestamp column plus a differently named TimestampVectorData",
+            columns=[
+                VectorData(name="timestamp", description="Acquisition sample counter", data=[10, 20]),
+                TimestampVectorData(name="event_time", description="Event times", data=[0.5, 1.5]),
+            ],
+        )
+
+        df, _ = get_bids_tabular(table)
+
+        self.assertIn("timestamp", df.columns)
+        self.assertNotIn("onset", df.columns)
+        self.assertEqual(list(df["timestamp"]), [10, 20])
+
+    def test_get_bids_tabular_timestamp_vector_data_renamed(self):
+        """A TimestampVectorData column named "timestamp" is renamed to onset."""
+        table = DynamicTable(
+            name="events",
+            description="A real timestamp column",
+            columns=[TimestampVectorData(name="timestamp", description="Event times", data=[0.5, 1.5])],
+        )
+
+        df, _ = get_bids_tabular(table)
+
+        self.assertIn("onset", df.columns)
+        self.assertNotIn("timestamp", df.columns)
+        self.assertEqual(list(df["onset"]), [0.5, 1.5])
+
+    def test_get_bids_tabular_extra_timestamp_column_not_renamed(self):
+        """Only the canonical "timestamp" column becomes onset, even with several time columns.
+
+        PyNWB 4 allows more than one TimestampVectorData column in an EventsTable (extra ones fill
+        DynamicTable's ``VectorData quantity: '*'`` slot), but BIDS has exactly one onset. The
+        column named "timestamp" -- the one the EventsTable schema requires -- is the canonical one.
+        """
+        events = EventsTable(name="events", description="Events with a second time column")
+        events.add_column(name="stop_time", description="End of the event", col_cls=TimestampVectorData)
+        events.add_event(timestamp=0.1, duration=0.05, stop_time=0.15)
+        events.add_event(timestamp=0.2, duration=0.05, stop_time=0.25)
+        self.assertEqual(
+            [name for name in events.colnames if isinstance(events[name], TimestampVectorData)],
+            ["timestamp", "stop_time"],
+        )
+
+        df, _ = get_bids_tabular(events)
+
+        self.assertIn("onset", df.columns)
+        self.assertNotIn("timestamp", df.columns)
+        self.assertIn("stop_time", df.columns)
+        self.assertEqual(list(df["onset"]), [0.1, 0.2])
+        self.assertEqual(list(df["stop_time"]), [0.15, 0.25])
 
     def test_get_bids_tabular_roundtrip(self):
         """Test roundtrip conversion: DataFrame/JSON -> EventsTable -> DataFrame/JSON."""

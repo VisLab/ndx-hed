@@ -1,5 +1,6 @@
 import json
 import io
+import math
 import pandas as pd
 import numpy as np
 from typing import Union
@@ -8,7 +9,11 @@ from hed.schema import HedSchema, HedSchemaGroup
 from pynwb.core import DynamicTable, VectorData
 from pynwb.event import EventsTable, TimestampVectorData, DurationVectorData
 from hdmf.common import MeaningsTable
-from ndx_hed import HedTags, HedValueVector
+from ndx_hed import HedLabMetaData, HedTags, HedValueVector
+
+# Sidecar key under which the HedLabMetaData definitions are exported. In BIDS, definitions live in
+# a sidecar entry that names no actual column; "definitions" is the conventional name for it.
+DEFINITIONS_KEY = "definitions"
 
 
 def extract_definitions(sidecar_data: dict, hed_schema: Union[HedSchema, HedSchemaGroup]) -> tuple:
@@ -160,7 +165,181 @@ def get_events_table(name: str, description: str, df: pd.DataFrame, meanings: di
     return events_tab
 
 
-def get_bids_tabular(table: DynamicTable) -> tuple:
+def _get_meanings_table(table: DynamicTable, col_name: str) -> Union["MeaningsTable", None]:
+    """
+    Returns the MeaningsTable annotating a column of a table, or None if the column has none.
+
+    Prefers the public DynamicTable.get_meanings_for_column() API (it raises KeyError when the
+    column has no MeaningsTable); falls back to the meanings_tables dict if the API is unavailable.
+
+    Args:
+        table (DynamicTable): The table owning the column.
+        col_name (str): The name of the column.
+
+    Returns:
+        MeaningsTable or None: The MeaningsTable annotating col_name, or None if there is none.
+    """
+    getter = getattr(table, "get_meanings_for_column", None)
+    if getter is not None:
+        try:
+            return getter(col_name)
+        except KeyError:
+            return None
+    return table.meanings_tables.get(f"{col_name}_meanings")
+
+
+def _is_missing(value) -> bool:
+    """
+    Returns True if a HED value is missing (None, the empty string, or a NaN of any float width).
+
+    The NaN test converts rather than checking isinstance(value, float): numpy's float32 and float16
+    do not subclass Python's float (only float64 does), so an isinstance check would silently treat
+    those NaNs as present.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    try:
+        return bool(math.isnan(value))
+    except (TypeError, ValueError):  # not a number at all, so not a NaN
+        return False
+
+
+def get_levels_and_hed(meanings_table: "MeaningsTable") -> tuple:
+    """
+    Extracts the BIDS "Levels" and "HED" dictionaries from a MeaningsTable without using pandas.
+
+    Args:
+        meanings_table (MeaningsTable): The MeaningsTable annotating a categorical column. Its
+            "value" and "meaning" columns supply the levels; an optional HedTags column named
+            "HED" supplies the per-value HED annotations.
+
+    Returns:
+        tuple: A tuple containing:
+            - dict: Levels -- maps each value to its meaning (empty string if there is no meaning).
+            - dict: HED -- maps each value to its HED string, omitting missing (None, NaN, or
+              empty) annotations. Empty if the MeaningsTable has no HED column.
+    """
+    values = list(meanings_table["value"].data)
+    meanings = list(meanings_table["meaning"].data) if "meaning" in meanings_table.colnames else []
+    hed_strings = list(meanings_table["HED"].data) if "HED" in meanings_table.colnames else []
+
+    levels = {}
+    hed_dict = {}
+    for index, value in enumerate(values):
+        levels[value] = meanings[index] if index < len(meanings) else ""
+        if index < len(hed_strings) and not _is_missing(hed_strings[index]):
+            hed_dict[value] = hed_strings[index]
+    return levels, hed_dict
+
+
+def get_json_hed_dict(table: DynamicTable, hed_metadata: HedLabMetaData = None) -> dict:
+    """
+    Builds the BIDS-style JSON sidecar dictionary of a DynamicTable directly from its columns.
+
+    This is the metadata half of get_bids_tabular(). It reads the column objects and the
+    MeaningsTable annotating each categorical column, so it needs neither a dataframe nor pandas.
+
+    Each entry maps a column name to a BIDS sidecar column-info dict, which may contain:
+        - "Description": the column's description, if it has one.
+        - "HED": for a HedValueVector, its value template (a string containing a single "#");
+          for a categorical column, a dict mapping each value to its HED string.
+        - "Levels": for a categorical column, a dict mapping each value to its meaning.
+
+    Columns contribute as follows:
+        - HedTags (the "HED" column): omitted entirely. Its cells are HED strings, so the column
+          is self-describing, and "HED" is a reserved sidecar key that must not name an entry.
+        - TimestampVectorData/DurationVectorData: description only, since the BIDS onset and
+          duration columns carry no HED metadata. The entry keeps the column's own name, so an
+          EventsTable "timestamp" column is keyed "timestamp" even though get_bids_tabular()
+          renames it to "onset" in the dataframe.
+        - HedValueVector: its HED template, unless the template is empty or "n/a".
+        - Any other column: the Levels and HED of the MeaningsTable annotating it, if any.
+
+    Columns with no metadata are omitted, so the result is empty for a table with no descriptions,
+    no MeaningsTables, and no HED template columns.
+
+    In NWB, HED definitions live in a HedLabMetaData object, which is the only place extra
+    definitions may come from. When one is given, its definitions are exported under the
+    "definitions" key as ``{"HED": {"defList": <definitions>}}`` -- a sidecar entry that names no
+    column, which is how BIDS carries definitions. The resulting sidecar is then self-contained:
+    the ``Def/`` references in the table can be resolved without supplying the definitions
+    separately. If the HedLabMetaData holds no definitions, no entry is added.
+
+    Parameters:
+        table (DynamicTable): The table to extract the sidecar metadata from. As with
+            get_bids_tabular(), this is not meant for a MeaningsTable, whose HED is consumed while
+            assembling the table whose column it annotates.
+        hed_metadata (HedLabMetaData, optional): The HED lab metadata supplying the definitions.
+            If None (the default), the sidecar carries no definitions.
+
+    Returns:
+        dict: The JSON sidecar data with column metadata, levels, HED annotations, and definitions.
+
+    Raises:
+        ValueError: If hed_metadata is given but is not a HedLabMetaData instance.
+        ValueError: If the definitions would overwrite the entry of a column named "definitions".
+    """
+    if hed_metadata is not None and not isinstance(hed_metadata, HedLabMetaData):
+        raise ValueError(
+            "The hed_metadata must be a HedLabMetaData instance -- in NWB it is the only source of "
+            f"extra HED definitions, but {type(hed_metadata).__name__} was given."
+        )
+
+    json_data = {}
+
+    for col_name in table.colnames:
+        column = table[col_name]
+        column_info = {}
+
+        # Add description if available
+        if hasattr(column, "description") and column.description:
+            column_info["Description"] = column.description
+
+        # Handle different column types
+        if isinstance(column, (TimestampVectorData, DurationVectorData)):
+            # The BIDS onset and duration columns don't carry HED metadata.
+            # TODO: Might need to extend the duration column to include a HED field if needed.
+            pass
+
+        elif isinstance(column, HedTags):
+            # The HED column is self-describing (its cells are HED strings). "HED" is a reserved
+            # sidecar key and must NOT appear as a sidecar metadata entry, so emit nothing for it.
+            continue
+
+        elif isinstance(column, HedValueVector):
+            if column.hed != "" and column.hed != "n/a":
+                column_info["HED"] = column.hed
+
+        else:
+            # A categorical column is a plain VectorData annotated by a MeaningsTable.
+            meanings_table = _get_meanings_table(table, col_name)
+            if meanings_table is not None:
+                levels, hed_dict = get_levels_and_hed(meanings_table)
+                if levels:
+                    column_info["Levels"] = levels
+                if hed_dict:
+                    column_info["HED"] = hed_dict
+
+        # Add column info to JSON if it has any metadata
+        if column_info:
+            json_data[col_name] = column_info
+
+    # Export the definitions from the HedLabMetaData -- the only source of extra HED definitions
+    definitions = hed_metadata.definitions if hed_metadata is not None else None
+    if definitions:
+        if DEFINITIONS_KEY in json_data:
+            raise ValueError(
+                f"Table '{table.name}' has a column named '{DEFINITIONS_KEY}', which collides with the "
+                f"sidecar key used to export the HED definitions. Rename the column to export definitions."
+            )
+        json_data[DEFINITIONS_KEY] = {"HED": {"defList": definitions}}
+
+    return json_data
+
+
+def get_bids_tabular(table: DynamicTable, hed_metadata: HedLabMetaData = None) -> tuple:
     """
     Converts a DynamicTable to a BIDS-style tabular representation (DataFrame and JSON sidecar).
 
@@ -171,83 +350,23 @@ def get_bids_tabular(table: DynamicTable) -> tuple:
 
     Parameters:
         table (DynamicTable): The table to convert.
+        hed_metadata (HedLabMetaData, optional): The HED lab metadata supplying the definitions,
+            passed through to get_json_hed_dict(). If None (the default), the sidecar carries no
+            definitions and any ``Def/`` references in the table cannot be resolved from it alone.
 
     Returns:
         tuple: A tuple containing:
             - pd.DataFrame: The table data with BIDS column names (onset, duration, etc.)
-            - dict: The JSON sidecar data with column metadata, levels, and HED annotations
+            - dict: The JSON sidecar data as returned by get_json_hed_dict().
     """
 
     # Get DataFrame from the table
     df = table.to_dataframe()
 
-    # Initialize JSON sidecar structure
-    json_data = {}
+    # Rename the timestamp column back to onset so the table reads as a BIDS timeline file. The
+    # "timestamp" column must itself be a TimestampVectorData -- an unrelated column that merely
+    # happens to be named "timestamp" is left alone.
+    if "timestamp" in table.colnames and isinstance(table["timestamp"], TimestampVectorData):
+        df = df.rename(columns={"timestamp": "onset"})
 
-    # Process each column to build JSON metadata
-    for col_name in table.colnames:
-        column = table[col_name]
-        column_info = {}
-
-        # Add description if available
-        if hasattr(column, "description") and column.description:
-            column_info["Description"] = column.description
-
-        # Handle different column types
-        if isinstance(column, TimestampVectorData):
-            # Rename timestamp back to onset in DataFrame
-            if "timestamp" in df.columns:
-                df = df.rename(columns={"timestamp": "onset"})
-            # TimestampVectorData doesn't typically have HED metadata in BIDS
-
-        elif isinstance(column, DurationVectorData):
-            # Duration column - no special HED metadata typically
-            # TODO: Might need to extend this to include a HED field if needed.
-            pass
-
-        elif isinstance(column, HedValueVector) and column.hed != "" and column.hed != "n/a":
-            column_info["HED"] = column.hed
-
-        elif isinstance(column, HedTags):
-            # The HED column is self-describing (its cells are HED strings). "HED" is a reserved
-            # sidecar key and must NOT appear as a sidecar metadata entry, so emit nothing for it.
-            continue
-
-        else:
-            # A categorical column is a plain VectorData annotated by a MeaningsTable. Prefer the
-            # public DynamicTable.get_meanings_for_column() API (it raises KeyError when the column
-            # has no MeaningsTable); fall back to the meanings_tables dict if the API is unavailable.
-            getter = getattr(table, "get_meanings_for_column", None)
-            if getter is not None:
-                try:
-                    meanings_table = getter(col_name)
-                except KeyError:
-                    meanings_table = None
-            else:
-                meanings_table = table.meanings_tables.get(f"{col_name}_meanings")
-            if meanings_table is not None:
-                meanings_df = meanings_table.to_dataframe()
-
-                # Build Levels dictionary
-                levels = {}
-                hed_dict = {}
-
-                for _, row in meanings_df.iterrows():
-                    value = row["value"]
-                    meaning = row.get("meaning", "")
-                    levels[value] = meaning
-
-                    # Check for HED column
-                    if "HED" in row and pd.notna(row["HED"]) and row["HED"] != "":
-                        hed_dict[value] = row["HED"]
-
-                if levels:
-                    column_info["Levels"] = levels
-                if hed_dict:
-                    column_info["HED"] = hed_dict
-
-        # Add column info to JSON if it has any metadata
-        if column_info:
-            json_data[col_name] = column_info
-
-    return df, json_data
+    return df, get_json_hed_dict(table, hed_metadata)
