@@ -3,12 +3,15 @@ Unit tests for HedNWBValidator class.
 """
 
 import unittest
+from unittest.mock import patch
 import pandas as pd
 from pynwb.core import DynamicTable, VectorData
 from ndx_hed import HedTags, HedLabMetaData, HedValueVector
+from ndx_hed.utils import hed_nwb_validator
 from ndx_hed.utils.hed_nwb_validator import HedNWBValidator
 from ndx_hed.utils.bids2nwb import get_events_table
 from hed.errors import ErrorHandler
+from hed.models import HedString
 
 
 class TestHedNWBValidatorInit(unittest.TestCase):
@@ -1646,6 +1649,61 @@ class TestValidateFile(unittest.TestCase):
         issues = self.validator.validate_file(self.nwbfile, error_handler)
 
         self.assertIsInstance(issues, list)
+
+
+class TestValidateRepeatedAnnotations(unittest.TestCase):
+    """Test class for the reuse of validation results across rows that repeat an annotation."""
+
+    def setUp(self):
+        """Set up test data."""
+        self.hed_metadata = HedLabMetaData(hed_schema_version="8.4.0")
+        self.validator = HedNWBValidator(self.hed_metadata)
+
+    def test_validate_vector_validates_each_distinct_annotation_once(self):
+        """Test that a repeated valid annotation is only validated on its first row."""
+        repeated_tags = HedTags(data=["Sensory-event", "Agent-action", "Sensory-event", "Agent-action"] * 25)
+
+        with patch.object(hed_nwb_validator, "HedString", side_effect=HedString) as hed_string_spy:
+            issues = self.validator.validate_vector(repeated_tags)
+
+        self.assertEqual(len(issues), 0)
+        self.assertEqual(hed_string_spy.call_count, 2)
+
+    def test_validate_vector_reports_every_row_of_a_repeated_invalid_annotation(self):
+        """Test that an invalid annotation is still reported on each row that has it."""
+        repeated_tags = HedTags(data=["NonExistentEvent", "Sensory-event", "NonExistentEvent"])
+
+        issues = self.validator.validate_vector(repeated_tags)
+
+        self.assertEqual(len(issues), 2)
+        self.assertEqual([issue["ec_row"] for issue in issues], [0, 2])
+
+    def test_validate_vector_result_does_not_depend_on_repetition(self):
+        """Test that repeating the rows of a column does not change the issues that are reported."""
+        distinct_issues = self.validator.validate_vector(HedTags(data=["Sensory-event", "NonExistentEvent"]))
+        repeated_issues = self.validator.validate_vector(
+            HedTags(data=["Sensory-event", "NonExistentEvent", "Sensory-event"])
+        )
+
+        self.assertEqual(len(distinct_issues), 1)
+        self.assertEqual(len(repeated_issues), 1)
+        self.assertEqual(distinct_issues[0]["code"], repeated_issues[0]["code"])
+
+    def test_validate_value_vector_validates_each_distinct_value_once(self):
+        """Test that a repeated value of a HedValueVector is only validated on its first row."""
+        repeated_values = HedValueVector(
+            name="duration",
+            description="Duration values with HED template",
+            data=[0.5, 1.0, 0.5, 1.0] * 25,
+            hed="(Duration/# s, (Sensory-event))",
+        )
+
+        with patch.object(hed_nwb_validator, "HedString", side_effect=HedString) as hed_string_spy:
+            issues = self.validator.validate_value_vector(repeated_values)
+
+        self.assertEqual(len(issues), 0)
+        # One call for the template itself, then one for each of the two distinct substituted values
+        self.assertEqual(hed_string_spy.call_count, 3)
 
 
 if __name__ == "__main__":
