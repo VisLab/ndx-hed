@@ -114,6 +114,8 @@ class HedNWBValidator:
         validated_without_issues = set()
 
         # Slice once: on a file-backed column, iterating the dataset directly is one HDF5 read per row.
+        # For an in-memory list the slice is a shallow copy of references (about 4 ms and 8 MB per
+        # million rows, the cost of validating a few rows); for a numpy array it is a view.
         for index, tag in enumerate(hed_tags.data[:]):
             if tag is None or tag == "" or tag == "n/a" or tag in validated_without_issues:
                 continue
@@ -161,6 +163,8 @@ class HedNWBValidator:
 
         validated_without_issues = set()
         # Slice once: on a file-backed column, iterating the dataset directly is one HDF5 read per row.
+        # For an in-memory list the slice is a shallow copy of references (about 4 ms and 8 MB per
+        # million rows, the cost of validating a few rows); for a numpy array it is a view.
         for index, tag in enumerate(hed_values.data[:]):
             if tag is None or tag == "" or tag == "n/a" or (isinstance(tag, float) and math.isnan(tag)):
                 continue
