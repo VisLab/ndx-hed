@@ -63,6 +63,8 @@ A `MeaningsTable` is not validated on its own. Its categorical HED is validated 
 
 `validate_table`, `validate_vector`, and `validate_value_vector` remain available for validating a single table or a single column in isolation (per-column checks). These do not perform row assembly or temporal validation; use `validate_file` (or `validate_events` for a single EventsTable) for full assembled validation.
 
+Issues returned by `validate_table` carry the hedtools error context for where the problem is: the table name in `ec_table_name`, the column name in `ec_column`, and the 0-based row index in `ec_row` (a `HedValueVector` template error has no row). `get_printable_issue_string` renders these as "Errors in table '<name>'", "Issues in column <name>", and "Issues in row <n>". Each column is read in a single slice, so validating a file-backed column costs one read rather than one read per row.
+
 ## Public API summary
 
 | Function                                                                   | Direction / purpose                                                                   |
@@ -81,7 +83,7 @@ In NWB, HED definitions live in the `HedLabMetaData` object, which is the only p
 {"definitions": {"HED": {"defList": "(Definition/go,(Sensory-event))"}}}
 ```
 
-so the sidecar is self-contained and any `Def/` references in the table resolve from it alone. Without the metadata no such entry is written, and `Def/` references in the exported sidecar are unresolvable (`DEF_INVALID`) unless the definitions are supplied separately — which is what `HedNWBValidator` does internally, passing the `DefinitionDict` from its own `HedLabMetaData` as hedtools' `extra_def_dicts`.
+so the sidecar is self-contained and any `Def/` references in the table resolve from it alone. Without the metadata no such entry is written, and `Def/` references in the exported sidecar are unresolvable (`DEF_INVALID`) unless the definitions are supplied separately - which is what `HedNWBValidator` does internally, passing the `DefinitionDict` from its own `HedLabMetaData` as hedtools' `extra_def_dicts`.
 | `HedNWBValidator.validate_file(nwbfile)`                                   | Assembled validation of every table in a file.                                        |
 | `HedNWBValidator.validate_events(events)`                                  | Assembled validation of a single `EventsTable`.                                       |
 | `HedNWBValidator.validate_table / validate_vector / validate_value_vector` | Per-column validation of a table or column.                                           |

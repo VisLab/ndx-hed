@@ -72,8 +72,7 @@ class HedNWBValidator:
         if error_handler is None:
             error_handler = ErrorHandler(check_for_warnings=False)
         issues = []
-        # TODO: FILE_NAME context needs to be replaced by TABLE context when available in hed-python
-        error_handler.push_error_context(ErrorContext.FILE_NAME, table.name)
+        error_handler.push_error_context(ErrorContext.TABLE_NAME, table.name)
         for col in table.columns:
             if isinstance(col, HedTags):
                 error_handler.push_error_context(ErrorContext.COLUMN, col.name)
@@ -114,7 +113,8 @@ class HedNWBValidator:
         issues = []
         validated_without_issues = set()
 
-        for index, tag in enumerate(hed_tags.data):
+        # Slice once: on a file-backed column, iterating the dataset directly is one HDF5 read per row.
+        for index, tag in enumerate(hed_tags.data[:]):
             if tag is None or tag == "" or tag == "n/a" or tag in validated_without_issues:
                 continue
 
@@ -160,7 +160,8 @@ class HedNWBValidator:
             return issues
 
         validated_without_issues = set()
-        for index, tag in enumerate(hed_values.data):
+        # Slice once: on a file-backed column, iterating the dataset directly is one HDF5 read per row.
+        for index, tag in enumerate(hed_values.data[:]):
             if tag is None or tag == "" or tag == "n/a" or (isinstance(tag, float) and math.isnan(tag)):
                 continue
 
