@@ -63,7 +63,12 @@ A `MeaningsTable` is not validated on its own. Its categorical HED is validated 
 
 `validate_table`, `validate_vector`, and `validate_value_vector` remain available for validating a single table or a single column in isolation (per-column checks). These do not perform row assembly or temporal validation; use `validate_file` (or `validate_events` for a single EventsTable) for full assembled validation.
 
-Issues returned by `validate_table` and `validate_file` carry the hedtools error context for where the problem is: the table name in `ec_table_name`, the column name in `ec_column`, and the row in `ec_row` (a `HedValueVector` template error has no row). Note that `validate_table` reports the 0-based row index while the assembled path in `validate_file` reports the 1-based row of the BIDS-style table, counting the header. `get_printable_issue_string` renders these as "Errors in table '<name>'", "Issues in column <name>", and "Issues in row <n>". Each column is read in a single slice, so validating a file-backed column costs one read rather than one read per row.
+Every issue returned by `validate_table` and `validate_file` carries the table name in `ec_table_name`. The rest of the location depends on the kind of issue:
+
+- A row issue (an error in a `HedTags` cell, or in a `HedValueVector` value after substitution) carries the column name in `ec_column` and the row in `ec_row`. `validate_table` reports the 0-based row index; the assembled path in `validate_file` reports the 1-based row of the BIDS-style table, counting the header.
+- A sidecar issue (an error in a `HedValueVector` template or in a MeaningsTable HED string) carries the column in `ec_sidecarColumnName` and, for categorical HED, the value in `ec_sidecarKeyName`. It has no row. In `validate_table` a template error likewise has the column in `ec_column` and no row.
+
+`get_printable_issue_string` renders these as "Errors in table '<name>'", "Issues in column <name>", "Issues in row <n>", "Column '<name>':", and "Key: <value>". Each column is read in a single slice, so validating a file-backed column costs one read rather than one read per row.
 
 ## Public API summary
 
@@ -74,6 +79,9 @@ Issues returned by `validate_table` and `validate_file` carry the hedtools error
 | `get_bids_tabular(table, hed_metadata=None)`                               | Any `DynamicTable` to a BIDS `(dataframe, sidecar)` pair. Formerly `get_bids_events`. |
 | `get_json_hed_dict(table, hed_metadata=None)`                              | Any `DynamicTable` to just its BIDS JSON sidecar dict (no dataframe, no pandas).      |
 | `get_levels_and_hed(meanings_table)`                                       | A `MeaningsTable` to its `(Levels, HED)` sidecar dictionaries.                        |
+| `HedNWBValidator.validate_file(nwbfile)`                                   | Assembled validation of every table in a file.                                        |
+| `HedNWBValidator.validate_events(events)`                                  | Assembled validation of a single `EventsTable`.                                       |
+| `HedNWBValidator.validate_table / validate_vector / validate_value_vector` | Per-column validation of a table or column.                                           |
 
 ### Definitions in the exported sidecar
 
@@ -84,9 +92,6 @@ In NWB, HED definitions live in the `HedLabMetaData` object, which is the only p
 ```
 
 so the sidecar is self-contained and any `Def/` references in the table resolve from it alone. Without the metadata no such entry is written, and `Def/` references in the exported sidecar are unresolvable (`DEF_INVALID`) unless the definitions are supplied separately - which is what `HedNWBValidator` does internally, passing the `DefinitionDict` from its own `HedLabMetaData` as hedtools' `extra_def_dicts`.
-| `HedNWBValidator.validate_file(nwbfile)`                                   | Assembled validation of every table in a file.                                        |
-| `HedNWBValidator.validate_events(events)`                                  | Assembled validation of a single `EventsTable`.                                       |
-| `HedNWBValidator.validate_table / validate_vector / validate_value_vector` | Per-column validation of a table or column.                                           |
 
 ## Relationship to BIDS
 

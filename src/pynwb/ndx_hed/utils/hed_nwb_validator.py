@@ -67,20 +67,24 @@ class HedNWBValidator:
         if error_handler is None:
             error_handler = ErrorHandler(check_for_warnings=False)
         issues = []
+        # Contexts are popped in finally blocks so that an exception raised while validating a column
+        # does not leave a stale context on a caller-provided error handler.
         error_handler.push_error_context(ErrorContext.TABLE_NAME, table.name)
-        for col in table.columns:
-            if isinstance(col, HedTags):
+        try:
+            for col in table.columns:
+                if isinstance(col, HedTags):
+                    validate_column = self.validate_vector
+                elif isinstance(col, HedValueVector):
+                    validate_column = self.validate_value_vector
+                else:
+                    continue
                 error_handler.push_error_context(ErrorContext.COLUMN, col.name)
-                col_issues = self.validate_vector(col, error_handler)
-                issues += col_issues
-                error_handler.pop_error_context()
-            elif isinstance(col, HedValueVector):
-                error_handler.push_error_context(ErrorContext.COLUMN, col.name)
-                col_issues = self.validate_value_vector(col, error_handler)
-                issues += col_issues
-                error_handler.pop_error_context()
-
-        error_handler.pop_error_context()
+                try:
+                    issues += validate_column(col, error_handler)
+                finally:
+                    error_handler.pop_error_context()
+        finally:
+            error_handler.pop_error_context()
         return issues
 
     def validate_vector(self, hed_tags: HedTags, error_handler: Optional[ErrorHandler] = None) -> List[Dict[str, Any]]:
@@ -116,10 +120,12 @@ class HedNWBValidator:
                 continue
 
             error_handler.push_error_context(ErrorContext.ROW, index)
-            hed_obj = HedString(tag, self.hed_schema, def_dict=self.def_dict)
-            row_issues = hed_obj.validate(allow_placeholders=False, error_handler=error_handler)
+            try:
+                hed_obj = HedString(tag, self.hed_schema, def_dict=self.def_dict)
+                row_issues = hed_obj.validate(allow_placeholders=False, error_handler=error_handler)
+            finally:
+                error_handler.pop_error_context()
             issues += row_issues
-            error_handler.pop_error_context()
 
             if not row_issues:
                 validated_without_issues.add(tag)
@@ -170,10 +176,12 @@ class HedNWBValidator:
                 continue
 
             error_handler.push_error_context(ErrorContext.ROW, index)
-            hed_obj = HedString(eval_tag, self.hed_schema, def_dict=self.def_dict)
-            row_issues = hed_obj.validate(allow_placeholders=False, error_handler=error_handler)
+            try:
+                hed_obj = HedString(eval_tag, self.hed_schema, def_dict=self.def_dict)
+                row_issues = hed_obj.validate(allow_placeholders=False, error_handler=error_handler)
+            finally:
+                error_handler.pop_error_context()
             issues += row_issues
-            error_handler.pop_error_context()
 
             if not row_issues:
                 validated_without_issues.add(eval_tag)

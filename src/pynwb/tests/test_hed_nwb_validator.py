@@ -12,7 +12,7 @@ from ndx_hed import HedTags, HedLabMetaData, HedValueVector
 from ndx_hed.utils import hed_nwb_validator
 from ndx_hed.utils.hed_nwb_validator import HedNWBValidator
 from ndx_hed.utils.bids2nwb import get_events_table
-from hed.errors import ErrorHandler, get_printable_issue_string
+from hed.errors import ErrorContext, ErrorHandler, get_printable_issue_string
 from hed.models import HedString
 
 
@@ -318,6 +318,17 @@ class TestValidateTable(unittest.TestCase):
             self.assertEqual(issue.get("ec_column"), "HED")
             self.assertIn("ec_row", issue)
         self.assertIn("Errors in table 'invalid_test_table'", get_printable_issue_string(issues))
+
+    def test_validate_table_restores_context_after_exception(self):
+        """Test that a failure inside a column leaves a caller-provided ErrorHandler's context stack as it was."""
+        error_handler = ErrorHandler(check_for_warnings=False)
+        error_handler.push_error_context(ErrorContext.FILE_NAME, "caller_context")
+
+        with patch.object(hed_nwb_validator, "HedString", side_effect=TypeError("unexpected cell type")):
+            with self.assertRaises(TypeError):
+                self.validator.validate_table(self.invalid_table, error_handler)
+
+        self.assertEqual(error_handler.error_context, [(ErrorContext.FILE_NAME, "caller_context")])
 
 
 class TestValidateEventsTable(unittest.TestCase):
